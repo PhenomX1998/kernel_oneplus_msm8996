@@ -357,12 +357,12 @@ static int fscrypt_d_revalidate(struct dentry *dentry, unsigned int flags)
 		return -ECHILD;
 
 	dir = dget_parent(dentry);
-	if (!d_inode(dir)->i_sb->s_cop->is_encrypted(d_inode(dir))) {
+	if (!dir->d_inode->i_sb->s_cop->is_encrypted(dir->d_inode)) {
 		dput(dir);
 		return 0;
 	}
 
-	ci = d_inode(dir)->i_crypt_info;
+	ci = dir->d_inode->i_crypt_info;
 	if (ci && ci->ci_keyring_key &&
 	    (ci->ci_keyring_key->flags & ((1 << KEY_FLAG_INVALIDATED) |
 					  (1 << KEY_FLAG_REVOKED) |
