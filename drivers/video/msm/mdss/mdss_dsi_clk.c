@@ -727,7 +727,7 @@ bool is_dsi_clk_in_ecg_state(void *client)
 
 
 	if (!client) {
-		pr_err("Invalid client params\n");
+		pr_err("Invalid params, client = %p\n", client);
 		goto end;
 	}
 
@@ -742,7 +742,7 @@ end:
 }
 
 int mdss_dsi_clk_req_state(void *client, enum mdss_dsi_clk_type clk,
-			enum mdss_dsi_clk_state state, u32 index)
+	enum mdss_dsi_clk_state state, u32 index)
 {
 	int rc = 0;
 	struct mdss_dsi_clk_client_info *c = client;

@@ -1890,6 +1890,18 @@ int mdss_dsi_clk_ctrl(struct mdss_dsi_ctrl_pdata *ctrl, void *clk_handle,
 	}
 
 	/*
+	 * it should add and remove extra votes based on voting clients to avoid
+	 * removal of legitimate vote from DSI client.
+	 */
+	if (mctrl && (clk_handle == ctrl->dsi_clk_handle)) {
+		m_clk_handle = mctrl->dsi_clk_handle;
+		vote_cnt = &mctrl->m_dsi_vote_cnt;
+	} else if (mctrl) {
+		m_clk_handle = mctrl->mdp_clk_handle;
+		vote_cnt = &mctrl->m_mdp_vote_cnt;
+	}
+
+	/*
 	 * When DSI is used in split mode, the link clock for master controller
 	 * has to be turned on first before the link clock for slave can be
 	 * turned on. In case the current controller is a slave, an ON vote is

@@ -72,6 +72,7 @@
 
 #define QPNP_FG_DEV_NAME "qcom,qpnp-fg"
 #define MEM_IF_TIMEOUT_MS	5000
+#define FG_CYCLE_MS		1500
 #define BUCKET_COUNT		8
 #define BUCKET_SOC_PCT		(256 / BUCKET_COUNT)
 
@@ -570,6 +571,7 @@ struct fg_chip {
 	struct fg_cc_soc_data	sw_cc_soc_data;
 	/* rslow compensation */
 	struct fg_rslow_data	rslow_comp;
+	int			rconn_mohm;
 	/* cycle counter */
 	struct fg_cyc_ctr_data	cyc_ctr;
 	/* iadc compensation */
@@ -604,7 +606,7 @@ struct fg_chip {
 	struct dischg_gain_soc	dischg_gain;
 	/* IMA error recovery */
 	struct completion	fg_reset_done;
-	struct delayed_work	ima_error_recovery_work;
+	struct work_struct	ima_error_recovery_work;
 	struct fg_wakeup_source	fg_reset_wakeup_source;
 	struct mutex		ima_recovery_lock;
 	bool			ima_error_handling;
@@ -612,6 +614,20 @@ struct fg_chip {
 	bool			irqs_enabled;
 	bool			use_last_soc;
 	int			last_soc;
+	/* Validating temperature */
+	int			last_good_temp;
+	int			batt_temp_low_limit;
+	int			batt_temp_high_limit;
+	/* Validating CC_SOC */
+	struct work_struct	cc_soc_store_work;
+	struct fg_wakeup_source	cc_soc_wakeup_source;
+	int			cc_soc_limit_pct;
+	bool			use_last_cc_soc;
+	int64_t			last_cc_soc;
+	/* Sanity check */
+	struct delayed_work	check_sanity_work;
+	struct fg_wakeup_source	sanity_wakeup_source;
+	u8			last_beat_count;
 };
 
 /* FG_MEMIF DEBUGFS structures */
@@ -1340,16 +1356,17 @@ static void fg_enable_irqs(struct fg_chip *chip, bool enable)
 
 static void fg_check_ima_error_handling(struct fg_chip *chip)
 {
-	mutex_lock(&chip->ima_recovery_lock);
-	if (!chip->ima_error_handling) {
-		fg_enable_irqs(chip, false);
-		chip->ima_error_handling = true;
-		schedule_delayed_work(&chip->ima_error_recovery_work,
-			msecs_to_jiffies(0));
-	} else {
+	if (chip->ima_error_handling) {
 		if (fg_debug_mask & FG_STATUS)
 			pr_info("IMA error is handled already!\n");
+		return;
 	}
+	mutex_lock(&chip->ima_recovery_lock);
+	fg_enable_irqs(chip, false);
+	chip->use_last_cc_soc = true;
+	chip->ima_error_handling = true;
+	if (!work_pending(&chip->ima_error_recovery_work))
+		schedule_work(&chip->ima_error_recovery_work);
 	mutex_unlock(&chip->ima_recovery_lock);
 }
 
@@ -2512,10 +2529,15 @@ static int update_sram_data(struct fg_chip *chip, int *resched_ms)
 				pr_err("Couldn't save sram registers\n");
 				goto out;
 			}
-			if (!chip->use_last_soc)
+			if (!chip->use_last_soc) {
 				chip->last_soc = get_monotonic_soc_raw(chip);
+				chip->last_cc_soc = div64_s64(
+					(int64_t)chip->last_soc *
+					FULL_PERCENT_28BIT, FULL_SOC_RAW);
+			}
 			if (fg_debug_mask & FG_STATUS)
-				pr_info("last_soc: %d\n", chip->last_soc);
+				pr_info("last_soc: %d last_cc_soc: %lld\n",
+					chip->last_soc, chip->last_cc_soc);
 		} else {
 			pr_err("update_sram failed\n");
 			goto out;
@@ -2535,6 +2557,52 @@ resched:
 out:
 	fg_relax(&chip->update_sram_wakeup_source);
 	return rc;
+}
+
+#define SANITY_CHECK_PERIOD_MS	5000
+static void check_sanity_work(struct work_struct *work)
+{
+	struct fg_chip *chip = container_of(work,
+				struct fg_chip,
+				check_sanity_work.work);
+	int rc = 0;
+	u8 beat_count;
+	bool tried_once = false;
+
+	fg_stay_awake(&chip->sanity_wakeup_source);
+
+try_again:
+	rc = fg_read(chip, &beat_count,
+			chip->mem_base + MEM_INTF_FG_BEAT_COUNT, 1);
+	if (rc) {
+		pr_err("failed to read beat count rc=%d\n", rc);
+		goto resched;
+	}
+
+	if (fg_debug_mask & FG_STATUS)
+		pr_info("current: %d, prev: %d\n", beat_count,
+			chip->last_beat_count);
+
+	if (chip->last_beat_count == beat_count) {
+		if (!tried_once) {
+			/* Wait for 1 FG cycle and read it once again */
+			msleep(1500);
+			tried_once = true;
+			goto try_again;
+		} else {
+			pr_err("Beat count not updating\n");
+			fg_check_ima_error_handling(chip);
+			goto out;
+		}
+	} else {
+		chip->last_beat_count = beat_count;
+	}
+resched:
+	schedule_delayed_work(
+		&chip->check_sanity_work,
+		msecs_to_jiffies(SANITY_CHECK_PERIOD_MS));
+out:
+	fg_relax(&chip->sanity_wakeup_source);
 }
 
 #define SRAM_TIMEOUT_MS			3000
@@ -2581,6 +2649,8 @@ out:
 				TEMP_SENSE_CHARGE_BIT)
 #define TEMP_PERIOD_UPDATE_MS		10000
 #define TEMP_PERIOD_TIMEOUT_MS		3000
+#define BATT_TEMP_LOW_LIMIT		-600
+#define BATT_TEMP_HIGH_LIMIT		1500
 static void update_temp_data(struct work_struct *work)
 {
 	s16 temp;
@@ -2632,8 +2702,33 @@ wait:
 	}
 
 	temp = reg[0] | (reg[1] << 8);
-	fg_data[0].value = (temp * TEMP_LSB_16B / 1000)
-		- DECIKELVIN;
+	temp = (temp * TEMP_LSB_16B / 1000) - DECIKELVIN;
+
+	/*
+	 * If temperature is within the specified range (e.g. -60C and 150C),
+	 * update it to the userspace. Otherwise, use the last read good
+	 * temperature.
+	 */
+	if (temp > chip->batt_temp_low_limit &&
+			temp < chip->batt_temp_high_limit) {
+		chip->last_good_temp = temp;
+		fg_data[0].value = temp;
+	} else {
+		fg_data[0].value = chip->last_good_temp;
+
+		/*
+		 * If the temperature is read before and seems to be in valid
+		 * range, then a bad temperature reading could be because of
+		 * FG lockup. Trigger the FG reset sequence in such cases.
+		 */
+		if (chip->last_temp_update_time && fg_reset_on_lockup &&
+			(chip->last_good_temp > chip->batt_temp_low_limit &&
+			chip->last_good_temp < chip->batt_temp_high_limit)) {
+			pr_err("Batt_temp is %d !, triggering FG reset\n",
+				temp);
+			fg_check_ima_error_handling(chip);
+		}
+	}
 
 	if (fg_debug_mask & FG_MEM_DEBUG_READS)
 		pr_info("BATT_TEMP %d %d\n", temp, fg_data[0].value);
@@ -2996,6 +3091,7 @@ static int lookup_soc_for_ocv(struct fg_chip *chip, int ocv)
 #define ESR_ACTUAL_REG		0x554
 #define BATTERY_ESR_REG		0x4F4
 #define TEMP_RS_TO_RSLOW_REG	0x514
+#define ESR_OFFSET		2
 static int estimate_battery_age(struct fg_chip *chip, int *actual_capacity)
 {
 	int64_t ocv_cutoff_new, ocv_cutoff_aged, temp_rs_to_rslow;
@@ -3036,7 +3132,7 @@ static int estimate_battery_age(struct fg_chip *chip, int *actual_capacity)
 
 	rc = fg_mem_read(chip, buffer, ESR_ACTUAL_REG, 2, 2, 0);
 	esr_actual = half_float(buffer);
-	rc |= fg_mem_read(chip, buffer, BATTERY_ESR_REG, 2, 2, 0);
+	rc |= fg_mem_read(chip, buffer, BATTERY_ESR_REG, 2, ESR_OFFSET, 0);
 	battery_esr = half_float(buffer);
 
 	if (rc) {
@@ -4457,7 +4553,36 @@ done:
 	fg_relax(&chip->gain_comp_wakeup_source);
 }
 
+static void cc_soc_store_work(struct work_struct *work)
+{
+	struct fg_chip *chip = container_of(work, struct fg_chip,
+					cc_soc_store_work);
+	int cc_soc_pct;
 
+	if (!chip->nom_cap_uah) {
+		pr_err("nom_cap_uah zero!\n");
+		fg_relax(&chip->cc_soc_wakeup_source);
+		return;
+	}
+
+	cc_soc_pct = get_sram_prop_now(chip, FG_DATA_CC_CHARGE);
+	cc_soc_pct = div64_s64(cc_soc_pct * 100,
+				chip->nom_cap_uah);
+	chip->last_cc_soc = div64_s64((int64_t)chip->last_soc *
+				FULL_PERCENT_28BIT, FULL_SOC_RAW);
+
+	if (fg_debug_mask & FG_STATUS)
+		pr_info("cc_soc_pct: %d last_cc_soc: %lld\n", cc_soc_pct,
+			chip->last_cc_soc);
+
+	if (fg_reset_on_lockup && (chip->cc_soc_limit_pct > 0 &&
+			cc_soc_pct >= chip->cc_soc_limit_pct)) {
+		pr_err("CC_SOC out of range\n");
+		fg_check_ima_error_handling(chip);
+	}
+
+	fg_relax(&chip->cc_soc_wakeup_source);
+}
 
 #define SOC_FIRST_EST_DONE	BIT(5)
 static bool is_first_est_done(struct fg_chip *chip)
@@ -4619,6 +4744,9 @@ static irqreturn_t fg_soc_irq_handler(int irq, void *_chip)
 			chip->last_soc = get_monotonic_soc_raw(chip);
 		if (fg_debug_mask & FG_STATUS)
 			pr_info("last_soc: %d\n", chip->last_soc);
+
+		fg_stay_awake(&chip->cc_soc_wakeup_source);
+		schedule_work(&chip->cc_soc_store_work);
 	}
 
 	if (chip->use_vbat_low_empty_soc) {
@@ -4780,7 +4908,6 @@ done:
 	fg_relax(&chip->resume_soc_wakeup_source);
 }
 
-
 #define OCV_COEFFS_START_REG		0x4C0
 #define OCV_JUNCTION_REG		0x4D8
 #define NOM_CAP_REG			0x4F4
@@ -4789,7 +4916,8 @@ done:
 #define RSLOW_CFG_OFFSET		2
 #define RSLOW_THRESH_REG		0x52C
 #define RSLOW_THRESH_OFFSET		0
-#define TEMP_RS_TO_RSLOW_OFFSET		2
+#define RS_TO_RSLOW_CHG_OFFSET		2
+#define RS_TO_RSLOW_DISCHG_OFFSET	0
 #define RSLOW_COMP_REG			0x528
 #define RSLOW_COMP_C1_OFFSET		0
 #define RSLOW_COMP_C2_OFFSET		2
@@ -4892,9 +5020,9 @@ static int populate_system_data(struct fg_chip *chip)
 	}
 	chip->rslow_comp.rslow_thr = buffer[0];
 	rc = fg_mem_read(chip, buffer, TEMP_RS_TO_RSLOW_REG, 2,
-			RSLOW_THRESH_OFFSET, 0);
+			RS_TO_RSLOW_CHG_OFFSET, 0);
 	if (rc) {
-		pr_err("unable to read rs to rslow: %d\n", rc);
+		pr_err("unable to read rs to rslow_chg: %d\n", rc);
 		goto done;
 	}
 	memcpy(chip->rslow_comp.rs_to_rslow, buffer, 2);
@@ -4908,6 +5036,68 @@ static int populate_system_data(struct fg_chip *chip)
 
 done:
 	fg_mem_release(chip);
+	return rc;
+}
+
+static int fg_update_batt_rslow_settings(struct fg_chip *chip)
+{
+	int64_t rs_to_rslow_chg, rs_to_rslow_dischg, batt_esr, rconn_uohm;
+	u8 buffer[2];
+	int rc;
+
+	rc = fg_mem_read(chip, buffer, BATTERY_ESR_REG, 2, ESR_OFFSET, 0);
+	if (rc) {
+		pr_err("unable to read battery_esr: %d\n", rc);
+		goto done;
+	}
+	batt_esr = half_float(buffer);
+
+	rc = fg_mem_read(chip, buffer, TEMP_RS_TO_RSLOW_REG, 2,
+			RS_TO_RSLOW_DISCHG_OFFSET, 0);
+	if (rc) {
+		pr_err("unable to read rs to rslow dischg: %d\n", rc);
+		goto done;
+	}
+	rs_to_rslow_dischg = half_float(buffer);
+
+	rc = fg_mem_read(chip, buffer, TEMP_RS_TO_RSLOW_REG, 2,
+			RS_TO_RSLOW_CHG_OFFSET, 0);
+	if (rc) {
+		pr_err("unable to read rs to rslow chg: %d\n", rc);
+		goto done;
+	}
+	rs_to_rslow_chg = half_float(buffer);
+
+	if (fg_debug_mask & FG_STATUS)
+		pr_info("rs_rslow_chg: %lld, rs_rslow_dischg: %lld, esr: %lld\n",
+			rs_to_rslow_chg, rs_to_rslow_dischg, batt_esr);
+
+	rconn_uohm = chip->rconn_mohm * 1000;
+	rs_to_rslow_dischg = div64_s64(rs_to_rslow_dischg * batt_esr,
+					batt_esr + rconn_uohm);
+	rs_to_rslow_chg = div64_s64(rs_to_rslow_chg * batt_esr,
+					batt_esr + rconn_uohm);
+
+	half_float_to_buffer(rs_to_rslow_chg, buffer);
+	rc = fg_mem_write(chip, buffer, TEMP_RS_TO_RSLOW_REG, 2,
+			RS_TO_RSLOW_CHG_OFFSET, 0);
+	if (rc) {
+		pr_err("unable to write rs_to_rslow_chg: %d\n", rc);
+		goto done;
+	}
+
+	half_float_to_buffer(rs_to_rslow_dischg, buffer);
+	rc = fg_mem_write(chip, buffer, TEMP_RS_TO_RSLOW_REG, 2,
+			RS_TO_RSLOW_DISCHG_OFFSET, 0);
+	if (rc) {
+		pr_err("unable to write rs_to_rslow_dischg: %d\n", rc);
+		goto done;
+	}
+
+	if (fg_debug_mask & FG_STATUS)
+		pr_info("Modified rs_rslow_chg: %lld, rs_rslow_dischg: %lld\n",
+			rs_to_rslow_chg, rs_to_rslow_dischg);
+done:
 	return rc;
 }
 
@@ -4937,7 +5127,7 @@ static int fg_rslow_charge_comp_set(struct fg_chip *chip)
 
 	half_float_to_buffer(chip->rslow_comp.chg_rs_to_rslow, buffer);
 	rc = fg_mem_write(chip, buffer,
-			TEMP_RS_TO_RSLOW_REG, 2, TEMP_RS_TO_RSLOW_OFFSET, 0);
+			TEMP_RS_TO_RSLOW_REG, 2, RS_TO_RSLOW_CHG_OFFSET, 0);
 	if (rc) {
 		pr_err("unable to write rs to rslow: %d\n", rc);
 		goto done;
@@ -4990,7 +5180,7 @@ static int fg_rslow_charge_comp_clear(struct fg_chip *chip)
 	}
 
 	rc = fg_mem_write(chip, chip->rslow_comp.rs_to_rslow,
-			TEMP_RS_TO_RSLOW_REG, 2, TEMP_RS_TO_RSLOW_OFFSET, 0);
+			TEMP_RS_TO_RSLOW_REG, 2, RS_TO_RSLOW_CHG_OFFSET, 0);
 	if (rc) {
 		pr_err("unable to write rs to rslow: %d\n", rc);
 		goto done;
@@ -5800,6 +5990,11 @@ wait:
 		}
 	}
 
+	if (chip->rconn_mohm > 0) {
+		rc = fg_update_batt_rslow_settings(chip);
+		if (rc)
+			pr_err("Error in updating ESR, rc=%d\n", rc);
+	}
 done:
 	if (chip->charging_disabled) {
 		rc = set_prop_enable_charging(chip, true);
@@ -5864,6 +6059,10 @@ reschedule:
 	schedule_delayed_work(
 		&chip->batt_profile_init,
 		msecs_to_jiffies(BATTERY_PSY_WAIT_MS));
+	cancel_delayed_work(&chip->update_sram_data);
+	schedule_delayed_work(
+		&chip->update_sram_data,
+		msecs_to_jiffies(0));
 	fg_relax(&chip->profile_wakeup_source);
 	return 0;
 }
@@ -6430,6 +6629,8 @@ static int fg_of_init(struct fg_chip *chip)
 				chip->slope_limit_coeffs[HIGH_TEMP_DISCHARGE]);
 	}
 
+	OF_READ_PROPERTY(chip->rconn_mohm, "fg-rconn-mohm", rc, 0);
+
 	chip->dischg_gain.enable = of_property_read_bool(node,
 					"qcom,fg-dischg-voltage-gain-ctrl");
 	if (chip->dischg_gain.enable) {
@@ -6446,6 +6647,20 @@ static int fg_of_init(struct fg_chip *chip)
 
 	chip->skip_first_estimate = of_property_read_bool(node,
 					"qcom,fg-skip-first-estimate");
+	OF_READ_PROPERTY(chip->batt_temp_low_limit,
+			"fg-batt-temp-low-limit", rc, BATT_TEMP_LOW_LIMIT);
+
+	OF_READ_PROPERTY(chip->batt_temp_high_limit,
+			"fg-batt-temp-high-limit", rc, BATT_TEMP_HIGH_LIMIT);
+
+	if (fg_debug_mask & FG_STATUS)
+		pr_info("batt-temp-low_limit: %d batt-temp-high_limit: %d\n",
+			chip->batt_temp_low_limit, chip->batt_temp_high_limit);
+
+	OF_READ_PROPERTY(chip->cc_soc_limit_pct, "fg-cc-soc-limit-pct", rc, 0);
+
+	if (fg_debug_mask & FG_STATUS)
+		pr_info("cc-soc-limit-pct: %d\n", chip->cc_soc_limit_pct);
 
 	return rc;
 }
@@ -6504,7 +6719,6 @@ static int fg_init_irqs(struct fg_chip *chip)
 				pr_err("Unable to get first-est-done irq\n");
 				return rc;
 			}
-
 
 			if (!chip->use_vbat_low_empty_soc) {
 				rc = devm_request_irq(chip->dev,
@@ -6627,14 +6841,15 @@ static int fg_init_irqs(struct fg_chip *chip)
 
 static void fg_cancel_all_works(struct fg_chip *chip)
 {
+	cancel_delayed_work_sync(&chip->check_sanity_work);
 	cancel_delayed_work_sync(&chip->update_sram_data);
 	cancel_delayed_work_sync(&chip->update_temp_work);
 	cancel_delayed_work_sync(&chip->update_jeita_setting);
 	cancel_delayed_work_sync(&chip->check_empty_work);
 	cancel_delayed_work_sync(&chip->batt_profile_init);
-	if (!chip->ima_error_handling)
-		cancel_delayed_work_sync(&chip->ima_error_recovery_work);
 	alarm_try_to_cancel(&chip->fg_cap_learning_alarm);
+	if (!chip->ima_error_handling)
+		cancel_work_sync(&chip->ima_error_recovery_work);
 	cancel_work_sync(&chip->rslow_comp_work);
 	cancel_work_sync(&chip->set_resume_soc_work);
 	cancel_work_sync(&chip->fg_cap_learning_work);
@@ -6650,6 +6865,7 @@ static void fg_cancel_all_works(struct fg_chip *chip)
 	cancel_work_sync(&chip->esr_extract_config_work);
 	cancel_work_sync(&chip->slope_limiter_work);
 	cancel_work_sync(&chip->dischg_gain_work);
+	cancel_work_sync(&chip->cc_soc_store_work);
 }
 
 static void fg_cleanup(struct fg_chip *chip)
@@ -6674,6 +6890,8 @@ static void fg_cleanup(struct fg_chip *chip)
 	wakeup_source_trash(&chip->slope_limit_wakeup_source.source);
 	wakeup_source_trash(&chip->dischg_gain_wakeup_source.source);
 	wakeup_source_trash(&chip->fg_reset_wakeup_source.source);
+	wakeup_source_trash(&chip->cc_soc_wakeup_source.source);
+	wakeup_source_trash(&chip->sanity_wakeup_source.source);
 }
 
 static int fg_remove(struct spmi_device *spmi)
@@ -7135,19 +7353,23 @@ static int bcl_trim_workaround(struct fg_chip *chip)
 	return 0;
 }
 
-#define FG_ALG_SYSCTL_1	0x4B0
-#define SOC_CNFG	0x450
-#define SOC_DELTA_OFFSET	3
-#define DELTA_SOC_PERCENT	1
-#define I_TERM_QUAL_BIT		BIT(1)
-#define PATCH_NEG_CURRENT_BIT	BIT(3)
+#define FG_ALG_SYSCTL_1			0x4B0
 #define KI_COEFF_PRED_FULL_ADDR		0x408
-#define KI_COEFF_PRED_FULL_4_0_MSB	0x88
-#define KI_COEFF_PRED_FULL_4_0_LSB	0x00
 #define TEMP_FRAC_SHIFT_REG		0x4A4
 #define FG_ADC_CONFIG_REG		0x4B8
+#define KI_COEFF_PRED_FULL_4_0_MSB	0x88
+#define KI_COEFF_PRED_FULL_4_0_LSB	0x00
 #define FG_BCL_CONFIG_OFFSET		0x3
+#define ALERT_CFG_OFFSET		3
+#define I_TERM_QUAL_BIT			BIT(1)
+#define PATCH_NEG_CURRENT_BIT		BIT(3)
 #define BCL_FORCED_HPM_IN_CHARGE	BIT(2)
+#define IRQ_USE_VOLTAGE_HYST_BIT	BIT(0)
+#define EMPTY_FROM_VOLTAGE_BIT		BIT(1)
+#define EMPTY_FROM_SOC_BIT		BIT(2)
+#define EMPTY_SOC_IRQ_MASK		(IRQ_USE_VOLTAGE_HYST_BIT | \
+					EMPTY_FROM_SOC_BIT | \
+					EMPTY_FROM_VOLTAGE_BIT)
 static int fg_common_hw_init(struct fg_chip *chip)
 {
 	int rc;
@@ -7277,6 +7499,41 @@ static int fg_common_hw_init(struct fg_chip *chip)
 		if (fg_debug_mask & FG_STATUS)
 			pr_info("rslow_comp active is %sabled\n",
 				chip->rslow_comp.active ? "en" : "dis");
+	}
+
+	rc = fg_mem_read(chip, &val, RSLOW_CFG_REG, 1, RSLOW_CFG_OFFSET,
+			0);
+	if (rc) {
+		pr_err("unable to read rslow cfg: %d\n", rc);
+		return rc;
+	}
+
+	if (val & RSLOW_CFG_ON_VAL)
+		chip->rslow_comp.active = true;
+
+	if (fg_debug_mask & FG_STATUS)
+		pr_info("rslow_comp active is %sabled\n",
+			chip->rslow_comp.active ? "en" : "dis");
+
+	/*
+	 * Clear bits 0-2 in 0x4B3 and set them again to make empty_soc irq
+	 * trigger again.
+	 */
+	rc = fg_mem_masked_write(chip, FG_ALG_SYSCTL_1, EMPTY_SOC_IRQ_MASK,
+			0, ALERT_CFG_OFFSET);
+	if (rc) {
+		pr_err("failed to write to 0x4B3 rc=%d\n", rc);
+		return rc;
+	}
+
+	/* Wait for a FG cycle before enabling empty soc irq configuration */
+	msleep(FG_CYCLE_MS);
+
+	rc = fg_mem_masked_write(chip, FG_ALG_SYSCTL_1, EMPTY_SOC_IRQ_MASK,
+			EMPTY_SOC_IRQ_MASK, ALERT_CFG_OFFSET);
+	if (rc) {
+		pr_err("failed to write to 0x4B3 rc=%d\n", rc);
+		return rc;
 	}
 
 	return 0;
@@ -7480,6 +7737,25 @@ static int fg_init_iadc_config(struct fg_chip *chip)
 	return 0;
 }
 
+static void fg_restore_cc_soc(struct fg_chip *chip)
+{
+	int rc;
+
+	if (!chip->use_last_cc_soc || !chip->last_cc_soc)
+		return;
+
+	if (fg_debug_mask & FG_STATUS)
+		pr_info("Restoring cc_soc: %lld\n", chip->last_cc_soc);
+
+	rc = fg_mem_write(chip, (u8 *)&chip->last_cc_soc,
+			fg_data[FG_DATA_CC_CHARGE].address, 4,
+			fg_data[FG_DATA_CC_CHARGE].offset, 0);
+	if (rc)
+		pr_err("failed to update CC_SOC rc=%d\n", rc);
+	else
+		chip->use_last_cc_soc = false;
+}
+
 static void fg_restore_soc(struct fg_chip *chip)
 {
 	int rc;
@@ -7503,34 +7779,11 @@ static void fg_restore_soc(struct fg_chip *chip)
 #define EN_WR_FGXCT_PRD		BIT(6)
 #define EN_RD_FGXCT_PRD		BIT(5)
 #define FG_RESTART_TIMEOUT_MS	12000
-static void fg_ima_error_cancel_works(struct fg_chip *chip)
-{
-             cancel_delayed_work(&chip->update_temp_work);
-             cancel_delayed_work(&chip->update_sram_data);
-             cancel_delayed_work(&chip->update_jeita_setting);
-             cancel_delayed_work(&chip->update_sram_data);
-             cancel_delayed_work(&chip->update_temp_work);
-             cancel_delayed_work(&chip->check_empty_work);
-             cancel_delayed_work(&chip->batt_profile_init);
-             alarm_try_to_cancel(&chip->fg_cap_learning_alarm);
-             cancel_work_sync(&chip->set_resume_soc_work);
-             cancel_work_sync(&chip->fg_cap_learning_work);
-             cancel_work_sync(&chip->dump_sram);
-             cancel_work_sync(&chip->status_change_work);
-             cancel_work_sync(&chip->update_esr_work);
-             cancel_work_sync(&chip->rslow_comp_work);
-             cancel_work_sync(&chip->sysfs_restart_work);
-             cancel_work_sync(&chip->gain_comp_work);
-             cancel_work_sync(&chip->charge_full_work);
-             cancel_work_sync(&chip->bcl_hi_power_work);
-             cancel_work_sync(&chip->esr_extract_config_work);
-}
-
 static void ima_error_recovery_work(struct work_struct *work)
 {
 	struct fg_chip *chip = container_of(work,
 				struct fg_chip,
-				ima_error_recovery_work.work);
+				ima_error_recovery_work);
 	bool tried_again = false;
 	int rc;
 
@@ -7553,12 +7806,16 @@ static void ima_error_recovery_work(struct work_struct *work)
 	/* Block SRAM access till FG reset is complete */
 	chip->block_sram_access = true;
 
+	/* Release the mutex to avoid deadlock while cancelling the works */
+	mutex_unlock(&chip->ima_recovery_lock);
+
 	/* Cancel all the works */
-	fg_ima_error_cancel_works(chip);
+	fg_cancel_all_works(chip);
 
 	if (fg_debug_mask & FG_STATUS)
 		pr_info("last_soc: %d\n", chip->last_soc);
 
+	mutex_lock(&chip->ima_recovery_lock);
 	/* Acquire IMA access forcibly from FG ALG */
 	rc = fg_masked_write(chip, chip->mem_base + MEM_INTF_IMA_CFG,
 			EN_WR_FGXCT_PRD | EN_RD_FGXCT_PRD,
@@ -7654,14 +7911,19 @@ wait:
 		goto out;
 	}
 
+	if (fg_debug_mask & FG_STATUS)
+		pr_info("IMA error recovery done...\n");
 out:
-	mutex_unlock(&chip->ima_recovery_lock);
 	fg_restore_soc(chip);
+	fg_restore_cc_soc(chip);
 	fg_enable_irqs(chip, true);
 	update_sram_data_work(&chip->update_sram_data.work);
 	update_temp_data(&chip->update_temp_work.work);
-	fg_relax(&chip->fg_reset_wakeup_source);
+	schedule_delayed_work(&chip->check_sanity_work,
+		msecs_to_jiffies(1000));
 	chip->ima_error_handling = false;
+	mutex_unlock(&chip->ima_recovery_lock);
+	fg_relax(&chip->fg_reset_wakeup_source);
 }
 
 #define DIG_MINOR		0x0
@@ -7798,6 +8060,10 @@ static void delayed_init_work(struct work_struct *work)
 	if (!chip->use_otp_profile)
 		schedule_delayed_work(&chip->batt_profile_init, 0);
 
+	if (chip->ima_supported && fg_reset_on_lockup)
+		schedule_delayed_work(&chip->check_sanity_work,
+			msecs_to_jiffies(1000));
+
 	if (chip->wa_flag & IADC_GAIN_COMP_WA) {
 		rc = fg_init_iadc_config(chip);
 		if (rc)
@@ -7865,6 +8131,10 @@ static int fg_probe(struct spmi_device *spmi)
 			"qpnp_fg_dischg_gain");
 	wakeup_source_init(&chip->fg_reset_wakeup_source.source,
 			"qpnp_fg_reset");
+	wakeup_source_init(&chip->cc_soc_wakeup_source.source,
+			"qpnp_fg_cc_soc");
+	wakeup_source_init(&chip->sanity_wakeup_source.source,
+			"qpnp_fg_sanity_check");
 	spin_lock_init(&chip->sec_access_lock);
 	mutex_init(&chip->rw_lock);
 	mutex_init(&chip->cyc_ctr.lock);
@@ -7877,8 +8147,8 @@ static int fg_probe(struct spmi_device *spmi)
 	INIT_DELAYED_WORK(&chip->update_temp_work, update_temp_data);
 	INIT_DELAYED_WORK(&chip->check_empty_work, check_empty_work);
 	INIT_DELAYED_WORK(&chip->batt_profile_init, batt_profile_init);
-	INIT_DELAYED_WORK(&chip->ima_error_recovery_work,
-			ima_error_recovery_work);
+	INIT_DELAYED_WORK(&chip->check_sanity_work, check_sanity_work);
+	INIT_WORK(&chip->ima_error_recovery_work, ima_error_recovery_work);
 	INIT_WORK(&chip->rslow_comp_work, rslow_comp_work);
 	INIT_WORK(&chip->fg_cap_learning_work, fg_cap_learning_work);
 	INIT_WORK(&chip->dump_sram, dump_sram);
@@ -7895,6 +8165,7 @@ static int fg_probe(struct spmi_device *spmi)
 	INIT_WORK(&chip->esr_extract_config_work, esr_extract_config_work);
 	INIT_WORK(&chip->slope_limiter_work, slope_limiter_work);
 	INIT_WORK(&chip->dischg_gain_work, discharge_gain_work);
+	INIT_WORK(&chip->cc_soc_store_work, cc_soc_store_work);
 	alarm_init(&chip->fg_cap_learning_alarm, ALARM_BOOTTIME,
 			fg_cap_learning_alarm_cb);
 	init_completion(&chip->sram_access_granted);
@@ -8034,6 +8305,8 @@ static int fg_probe(struct spmi_device *spmi)
 		}
 	}
 
+	/* Fake temperature till the actual temperature is read */
+	chip->last_good_temp = 250;
 	schedule_work(&chip->init_work);
 
 	pr_info("FG Probe success - FG Revision DIG:%d.%d ANA:%d.%d PMIC subtype=%d\n",
@@ -8066,6 +8339,8 @@ of_init_fail:
 	wakeup_source_trash(&chip->slope_limit_wakeup_source.source);
 	wakeup_source_trash(&chip->dischg_gain_wakeup_source.source);
 	wakeup_source_trash(&chip->fg_reset_wakeup_source.source);
+	wakeup_source_trash(&chip->cc_soc_wakeup_source.source);
+	wakeup_source_trash(&chip->sanity_wakeup_source.source);
 	return rc;
 }
 
@@ -8177,7 +8452,7 @@ static int fg_reset_lockup_set(const char *val, const struct kernel_param *kp)
 
 	rc = param_set_int(val, kp);
 	if (rc) {
-		pr_err("Unable to set fg_sense_type: %d\n", rc);
+		pr_err("Unable to set fg_reset_on_lockup: %d\n", rc);
 		return rc;
 	}
 
@@ -8202,6 +8477,13 @@ static int fg_reset_lockup_set(const char *val, const struct kernel_param *kp)
 
 	if (fg_debug_mask & FG_STATUS)
 		pr_info("fg_reset_on_lockup set to %d\n", fg_reset_on_lockup);
+
+	if (fg_reset_on_lockup)
+		schedule_delayed_work(&chip->check_sanity_work,
+			msecs_to_jiffies(1000));
+	else
+		cancel_delayed_work_sync(&chip->check_sanity_work);
+
 	return rc;
 }
 
