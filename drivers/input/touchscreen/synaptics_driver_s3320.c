@@ -1224,6 +1224,11 @@ static void gesture_judge(struct synaptics_ts_data *ts)
 			gesture == Wgestrue ? "(W)" : "[unknown]");
 	synaptics_get_coordinate_point(ts);
 
+
+    TPD_DEBUG("gesture suport LeftVee:%d RightVee:%d DouSwip:%d Circle:%d UpVee:%d DouTap:%d\n",\
+        LeftVee_gesture,RightVee_gesture,DouSwip_gesture,Circle_gesture,UpVee_gesture,DouTap_gesture);
+	
+	
 #ifdef WAKE_GESTURES
 	if ((gesture == Down2UpSwip && s2w_switch & SWEEP_UP) ||
 		(gesture == Up2DownSwip && s2w_switch & SWEEP_DOWN) ||
@@ -1272,8 +1277,6 @@ static void gesture_judge(struct synaptics_ts_data *ts)
 		}
 	} else
 #endif
-    TPD_DEBUG("gesture suport LeftVee:%d RightVee:%d DouSwip:%d Circle:%d UpVee:%d DouTap:%d\n",\
-        LeftVee_gesture,RightVee_gesture,DouSwip_gesture,Circle_gesture,UpVee_gesture,DouTap_gesture);
 	if((gesture == DouTap && DouTap_gesture)||(gesture == RightVee && RightVee_gesture)\
         ||(gesture == LeftVee && LeftVee_gesture)||(gesture == UpVee && UpVee_gesture)\
         ||(gesture == Circle && Circle_gesture)||(gesture == DouSwip && DouSwip_gesture)){
