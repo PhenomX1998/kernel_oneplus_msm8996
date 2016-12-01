@@ -27,12 +27,13 @@ nocol='\033[0m'
 
 # Directories
 KERNEL_DIR=$PWD
-KERN_IMG=$KERNEL_DIR/arch/arm/boot/Image.gz-dtb
-OUT_DIR=$KERNEL_DIR/zipping/onyx
+KERN_IMG=$KERNEL_DIR/arch/arm64/boot/Image.gz-dtb
+OUT_DIR=$KERNEL_DIR/zipping/oneplus3
 REACTOR_VERSION="alpha-0.1-TEST"
 
 # Device Spceifics
-export ARCH=arm
+export ARCH=arm64
+export SUBARCH=arm64
 export CROSS_COMPILE="ccache /home/nachiket/Android/android-ndk-r13/toolchains/aarch64-linux-android-4.9/prebuilt/linux-x86_64/bin/aarch64-linux-android-"
 export KBUILD_BUILD_USER="nachiket"
 export KBUILD_BUILD_HOST="reactor"
